@@ -134,6 +134,20 @@ CONE_EXIT_HOLD_S = float(os.environ.get("PC_CONE_EXIT_HOLD_S", 0) or 0)
 # SIM route, object identity, or pose. If both modes are given, distance wins.
 CONE_EXIT_HOLD_M = float(os.environ.get("PC_CONE_EXIT_HOLD_M", 0) or 0)
 
+# v6-1 straight-line stabiliser.  Real-camera estimates on a straight vary by
+# a few hundredths frame to frame; with v4's full gain that became alternating
+# ±1–3 degree commands at 1.30 m/s.  The filter is deliberately eligible only
+# for a clear, nearly straight road with no active cone correction.  On a bend,
+# recovery, blind frame, or cone manoeuvre, v4's steering is passed unchanged.
+STRAIGHT_STABILIZE = os.environ.get("PC_STRAIGHT_STABILIZE", "1") == "1"
+STRAIGHT_VIEW_MIN = float(os.environ.get("PC_STRAIGHT_VIEW_MIN", 0.70))
+STRAIGHT_SLOPE_MAX = float(os.environ.get("PC_STRAIGHT_SLOPE_MAX", 0.07))
+STRAIGHT_STEER_MAX = float(os.environ.get("PC_STRAIGHT_STEER_MAX", 7.0))
+STRAIGHT_ENTER_FRAMES = int(os.environ.get("PC_STRAIGHT_ENTER_FRAMES", 3))
+STRAIGHT_DEADBAND_DEG = float(os.environ.get("PC_STRAIGHT_DEADBAND_DEG", 0.75))
+STRAIGHT_EMA_ALPHA = float(os.environ.get("PC_STRAIGHT_EMA_ALPHA", 0.42))
+STRAIGHT_SLEW_DEG = float(os.environ.get("PC_STRAIGHT_SLEW_DEG", 1.8))
+
 
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -143,7 +157,8 @@ class Telemetry:
     """Optional CSV logger that can never become a control-loop failure."""
 
     fields = ("elapsed_s", "source", "offset", "slope", "view", "conf",
-              "speed_cmd", "steer_cmd_deg", "cone_count", "cone_distance_m",
+              "speed_cmd", "steer_cmd_deg", "raw_steer_cmd_deg",
+              "straight_stabilized", "cone_count", "cone_distance_m",
               "cone_bearing_deg", "cone_ff_deg", "cone_exit_ff_deg",
               "cone_speed_cap_mps")
 
@@ -369,6 +384,10 @@ def main():
     cone_exit_until = 0.0
     cone_exit_remaining_m = 0.0
     cone_exit_last_tick = None
+    # The state is only used after several consecutive clear-straight frames.
+    # Resetting it on every corner/avoidance keeps v4's responsive turn-in.
+    straight_frames = 0
+    straight_ema = None
     try:
         while running[0]:
             tick = time.time()
@@ -466,6 +485,36 @@ def main():
                 elif not cone_exit_remaining_m and not cone_exit_until:
                     cone_exit_ff = 0.0
                     cone_exit_last_tick = None
+                # Preserve the exact v4 command everywhere except a confirmed,
+                # clear straight.  Cone feed-forward is explicitly excluded:
+                # it is a safety manoeuvre, not centring noise.
+                raw_steer = steer
+                straight_ok = (
+                    STRAIGHT_STABILIZE and est.ok and not cff and not exit_ff
+                    and est.view >= STRAIGHT_VIEW_MIN
+                    and abs(est.slope) <= STRAIGHT_SLOPE_MAX
+                    and abs(raw_steer) <= STRAIGHT_STEER_MAX
+                )
+                if straight_ok:
+                    straight_frames += 1
+                else:
+                    straight_frames = 0
+                    straight_ema = None
+
+                straight_stabilized = False
+                if straight_frames >= max(1, STRAIGHT_ENTER_FRAMES):
+                    alpha = max(0.0, min(1.0, STRAIGHT_EMA_ALPHA))
+                    straight_ema = (raw_steer if straight_ema is None else
+                                    alpha * raw_steer + (1.0 - alpha) * straight_ema)
+                    steer = 0.0 if abs(straight_ema) < STRAIGHT_DEADBAND_DEG else straight_ema
+                    # Camera→HTTP→servo delay makes a one-frame reversal on a
+                    # fast straight physically arrive too late.  Bound only the
+                    # v6 straight command; corner/recovery commands are intact.
+                    if STRAIGHT_SLEW_DEG > 0:
+                        steer = max(last_steer - STRAIGHT_SLEW_DEG,
+                                    min(last_steer + STRAIGHT_SLEW_DEG, steer))
+                    straight_stabilized = True
+
                 if SETTLE:
                     steer, flip_pending = control.settle(
                         steer, last_steer, flip_pending)
@@ -503,6 +552,8 @@ def main():
                     "conf": f"{est.conf:.4f}",
                     "speed_cmd": f"{speed:.3f}",
                     "steer_cmd_deg": f"{steer:.3f}",
+                    "raw_steer_cmd_deg": f"{raw_steer:.3f}",
+                    "straight_stabilized": int(straight_stabilized),
                     "cone_count": len(seen),
                     "cone_distance_m": "" if near is None else f"{near.distance:.3f}",
                     "cone_bearing_deg": "" if near is None else f"{near.bearing:.3f}",
@@ -513,9 +564,11 @@ def main():
 
                 if tick - last_log >= 2.0:
                     last_log = tick
+                    tag = " straight-filter" if straight_stabilized else ""
                     log(f"{est.source:5s} off={est.offset:+.2f} "
                         f"bend={est.slope:+.2f} view={est.view:.2f} -> "
-                        f"steer={steer:+6.1f}deg speed={speed:.2f}")
+                        f"steer={steer:+6.1f}deg raw={raw_steer:+6.1f}deg "
+                        f"speed={speed:.2f}{tag}")
                 n += 1
             except Exception as exc:              # noqa: BLE001
                 # One bad frame or one dropped request must not end the run.
